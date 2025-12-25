@@ -88,7 +88,7 @@ def generate_preamble(proto_module: str) -> str:
             "from __future__ import annotations",
             "import abc",
             "from typing import Any",
-            "from actr import WorkloadBase",
+            "from actr import WorkloadBase, Context",
             f"import {proto_module} as pb2",
         ]
     )
@@ -126,6 +126,8 @@ def generate_dispatcher(dispatcher_name: str, methods) -> str:
     else:
         lines.append("        method_name, req_cls, resp_cls = _resolve_route(route_key)")
         lines.append("        req = req_cls.FromString(payload)")
+        lines.append("        if not isinstance(ctx, Context):")
+        lines.append("            ctx = Context(ctx)")
         lines.append("        resp = await getattr(handler, method_name)(req, ctx)")
         lines.append("        return _encode_response(resp, resp_cls)")
 
