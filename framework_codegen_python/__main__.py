@@ -3,17 +3,11 @@ from __future__ import annotations
 
 import sys
 from typing import List, Dict
-from dataclasses import dataclass
 
 from google.protobuf.compiler import plugin_pb2 as plugin
 
-
-@dataclass
-class RemoteServiceInfo:
-    """Information about a remote service for proxying."""
-    service_name: str
-    route_keys: List[str]
-    actr_type: str  # e.g., "acme+DataStreamConcurrentServer"
+# Import from generators module
+from .generators import RemoteServiceInfo, make_route_key, ensure_no_streaming_methods
 
 
 def main() -> int:
@@ -25,48 +19,52 @@ def main() -> int:
     # Parse parameters
     parameters = parse_parameters(request.parameter)
 
-    manufacturer = parameters.get("Manufacturer", "acme")
+    # Parse LocalFiles (unified parameter name)
+    local_files_str = parameters.get("LocalFiles", "")
+    local_files_set = set(f for f in local_files_str.split(":") if f)
     
-    local_file_param = parameters.get("LocalFile")
-    proto_source_param = parameters.get("ProtoSource", "").lower()
-    global_proto_source = proto_source_param or ("remote" if local_file_param else "local")
-    
-    remote_files_param = set(parameters.get("RemoteFiles", "").split(":")) if parameters.get("RemoteFiles") else set()
-    
-    # Parse RemoteActrTypes (aligned with RemoteFiles order)
-    remote_actr_types_param = parameters.get("RemoteActrTypes", "").split(":") if parameters.get("RemoteActrTypes") else []
-    
-    # Build mapping: remote file path -> actr_type
+    # Parse RemoteFileMapping in format: path1=actr_type1:path2=actr_type2
+    remote_mapping_str = parameters.get("RemoteFileMapping", "")
     remote_file_to_actr_type: Dict[str, str] = {}
-    remote_files_list = list(remote_files_param)
-    for i, file_path in enumerate(remote_files_list):
-        if i < len(remote_actr_types_param) and remote_actr_types_param[i]:
-            remote_file_to_actr_type[file_path] = remote_actr_types_param[i]
-        else:
-            # Fallback to manufacturer+ServiceName if no actr_type provided
-            remote_file_to_actr_type[file_path] = ""
+    
+    if remote_mapping_str:
+        for pair in remote_mapping_str.split(":"):
+            if "=" in pair:
+                file_path, actr_type = pair.split("=", 1)
+                if file_path and actr_type:
+                    remote_file_to_actr_type[file_path] = actr_type
+                else:
+                    print(f"WARNING: Invalid mapping pair: {pair}", file=sys.stderr)
+            else:
+                print(f"WARNING: Invalid mapping format (missing '='): {pair}", file=sys.stderr)
+    
+    print(f"DEBUG: Parsed {len(remote_file_to_actr_type)} remote file mappings", file=sys.stderr)
+    print(f"DEBUG: Parsed {len(local_files_set)} local files", file=sys.stderr)
  
     # First pass: Collect info about all Remote services
     remote_services: List[RemoteServiceInfo] = []
     for file_desc in request.proto_file:
-        is_remote = determine_if_remote(
-            file_desc.name, 
-            local_file_param, 
-            remote_files_param, 
-            global_proto_source
-        )
+        # Normalize file path for comparison
+        normalized_file_name = file_desc.name.replace("\\", "/")
+        
+        # Determine if this file is remote
+        is_remote = normalized_file_name in remote_file_to_actr_type
         
         if is_remote:
-            # Get actr_type for this file
-            actr_type = remote_file_to_actr_type.get(file_desc.name, "")
+            # Get actr_type for this file from the mapping
+            actr_type = remote_file_to_actr_type.get(normalized_file_name, "")
             
-            # If no actr_type from lock file, try to infer from service name
+            # Critical: Do NOT fallback - fail fast if actr_type is missing
             if not actr_type:
-                # Fallback: use manufacturer + first service name
-                if file_desc.service:
-                    actr_type = f"{manufacturer}+{file_desc.service[0].name}"
-                else:
-                    actr_type = f"{manufacturer}+UnknownService"
+                print(
+                    f"ERROR: Remote file '{file_desc.name}' found but has no actr_type mapping.",
+                    file=sys.stderr
+                )
+                print(
+                    f"Available mappings: {list(remote_file_to_actr_type.keys())}",
+                    file=sys.stderr
+                )
+                sys.exit(1)
             
             for service in file_desc.service:
                 route_keys = []
@@ -80,76 +78,63 @@ def main() -> int:
                         actr_type=actr_type
                     )
                 )
+                print(
+                    f"INFO: Registered remote service '{service.name}' with actr_type '{actr_type}'",
+                    file=sys.stderr
+                )
 
-    # Second pass: Generate content for each file
+
+    # Second pass: Generate content for each file using Strategy Pattern
     response = plugin.CodeGeneratorResponse()
     response.supported_features = plugin.CodeGeneratorResponse.FEATURE_PROTO3_OPTIONAL
 
-    has_local_workload = False  # Track if we generated any local workload
+    # Import strategy classes
+    from .strategies import GenerationContext, StrategySelector
+    from .concrete_strategies import (
+        create_default_strategies,
+        DefaultClientWorkloadStrategy,
+    )
 
+    # Create generation context
+    context = GenerationContext(
+        remote_file_to_actr_type=remote_file_to_actr_type,
+        local_files_set=local_files_set,
+        remote_services=remote_services,
+    )
+
+    # Create strategy selector with default strategies
+    selector = StrategySelector(create_default_strategies())
+
+    # Process each file using the appropriate strategy
     for file_name in request.file_to_generate:
         file_desc = next((f for f in request.proto_file if f.name == file_name), None)
         if file_desc is None:
             continue
 
-        is_remote = determine_if_remote(
-            file_desc.name,
-            local_file_param,
-            remote_files_param,
-            global_proto_source
-        )
-
-        # Skip generating files without services and not marked as LocalFile
-        if not file_desc.service and local_file_param != file_desc.name:
+        # Skip files without services and not explicitly marked as local
+        if not file_desc.service and not context.is_local(file_desc):
+            print(
+                f"DEBUG: Skipping file '{file_desc.name}' (no services, not local)",
+                file=sys.stderr
+            )
             continue
 
-        # For Local mode with no services, generate a generic Workload with all remote proxies
-        if not is_remote and not file_desc.service:
-            output = generate_empty_local_workload(
-                file_desc.package,
-                file_desc.name,
-                remote_services,
-                manufacturer,
-            )
-            f = response.file.add()
-            f.name = output["name"]
-            f.content = output["content"]
-            has_local_workload = True
-        elif is_remote:
-            # For remote services, only generate RPC request extensions
-            for service in file_desc.service:
-                output = generate_remote_extensions_only(
-                    file_desc.package,
-                    file_desc.name,
-                    service.name,
-                    service.method,
-                )
+        # Select and apply the appropriate strategy
+        strategy = selector.select_strategy(file_desc, context)
+        if strategy:
+            generated_files = strategy.generate(file_desc, context)
+            for gen_file in generated_files:
                 f = response.file.add()
-                f.name = output["name"]
-                f.content = output["content"]
-        else:
-            # For local services, generate full actor code
-            for service in file_desc.service:
-                output = generate_local_actor_code(
-                    package_name=file_desc.package,
-                    proto_name=file_desc.name,
-                    service_name=service.name,
-                    methods=service.method,
-                    remote_services=remote_services,
-                    manufacturer=manufacturer,
-                )
-                f = response.file.add()
-                f.name = f"{to_snake_case(service.name)}_actor.py"
-                f.content = output
-                has_local_workload = True
+                f.name = gen_file.name
+                f.content = gen_file.content
 
-    # If we have remote services but no local workload was generated, 
-    # generate a generic client workload
-    if remote_services and not has_local_workload:
-        output = generate_client_workload(remote_services, manufacturer)
+    # Generate default client workload if needed
+    if DefaultClientWorkloadStrategy.should_generate(context):
+        gen_file = DefaultClientWorkloadStrategy.generate_default_workload(context)
         f = response.file.add()
-        f.name = output["name"]
-        f.content = output["content"]
+        f.name = gen_file.name
+        f.content = gen_file.content
+
 
     # Generate __init__.py for all directories involved
     generated_dirs = set()
@@ -193,435 +178,6 @@ def parse_parameters(param_str: str) -> Dict[str, str]:
     return params
 
 
-def determine_if_remote(
-    file_name: str,
-    local_file_param: str | None,
-    remote_files_param: set,
-    global_proto_source: str,
-) -> bool:
-    """Determine if a proto file should be treated as remote."""
-    if file_name in remote_files_param:
-        return True
-    if local_file_param == file_name:
-        return False
-    return global_proto_source == "remote"
-
-
-def generate_empty_local_workload(
-    package_name: str,
-    proto_name: str,
-    remote_services: List[RemoteServiceInfo],
-    manufacturer: str,
-) -> dict:
-    """Generate a workload for an empty local proto that proxies remote services."""
-    module_name = proto_module_name(proto_name)
-    pkg_name = package_name.replace(".", "_").title() if package_name else "Client"
-    workload_name = f"{pkg_name}Workload"
-    file_name = f"{to_snake_case(pkg_name)}_workload.py"
-    
-    sections: List[str] = [
-        generate_preamble(module_name),
-        generate_empty_workload_with_proxy(workload_name, remote_services, manufacturer),
-    ]
-    
-    content = "\n\n".join(section for section in sections if section)
-    return {"name": file_name, "content": content}
-
-
-def generate_remote_extensions_only(
-    package_name: str,
-    proto_name: str,
-    service_name: str,
-    methods,
-) -> dict:
-    """Generate only RPC request extensions for remote services."""
-    ensure_no_streaming_methods(service_name, methods)
-    module_name = proto_module_name(proto_name)
-    
-    # Extract directory path from proto_name (e.g., "remote/echo-echo-server/echo.proto")
-    # Output client file to the same directory as the pb2 file
-    # Note: protoc converts hyphens to underscores in directory names
-    proto_dir = proto_name.rsplit("/", 1)[0] if "/" in proto_name else ""
-    # Convert hyphens to underscores to match protoc's output
-    proto_dir = proto_dir.replace("-", "_") if proto_dir else ""
-    file_base_name = f"{to_snake_case(service_name)}_client.py"
-    file_name = f"{proto_dir}/{file_base_name}" if proto_dir else file_base_name
-    
-    # Use relative import since client file is in the same directory as pb2 file
-    sections: List[str] = [
-        generate_preamble(module_name, use_relative_import=True),
-        generate_rpc_request_extensions(package_name, service_name, methods),
-    ]
-    
-    content = "\n\n".join(section for section in sections if section)
-    return {"name": file_name, "content": content}
-
-
-def proto_module_name(proto_path: str) -> str:
-    """Convert proto file path to Python module name."""
-    file_name = proto_path.rsplit("/", 1)[-1]
-    stem = file_name[:-6] if file_name.endswith(".proto") else file_name
-    return f"{stem}_pb2"
-
-
-def generate_local_actor_code(
-    package_name: str,
-    proto_name: str,
-    service_name: str,
-    methods,
-    remote_services: List[RemoteServiceInfo],
-    manufacturer: str,
-) -> str:
-    """Generate actor code for local services."""
-    handler_name = f"{service_name}Handler"
-    dispatcher_name = f"{service_name}Dispatcher"
-    workload_name = f"{service_name}Workload"
-    proto_module = proto_module_name(proto_name)
-
-    sections: List[str] = [
-        generate_preamble(proto_module, use_relative_import=True),
-        generate_handler(handler_name, methods),
-        generate_dispatcher(dispatcher_name, methods, remote_services, manufacturer),
-    ]
-
-    if methods:
-        sections.append(generate_route_helpers(package_name, service_name, methods))
-
-    sections.append(generate_rpc_request_extensions(package_name, service_name, methods))
-    sections.append(generate_workload(workload_name, handler_name, dispatcher_name))
-
-    return "\n\n".join(section for section in sections if section)
-
-
-def generate_preamble(proto_module: str, use_relative_import: bool = False) -> str:
-    """Generate file header and imports.
-    
-    Args:
-        proto_module: Name of the protobuf module (e.g., 'echo_pb2')
-        use_relative_import: If True, use relative import for pb2 module
-    """
-    # For remote client files in subdirectories, use relative import
-    if use_relative_import:
-        import_line = f"from . import {proto_module} as pb2"
-    else:
-        import_line = f"import {proto_module} as pb2"
-    
-    return "\n".join(
-        [
-            "# DO NOT EDIT.",
-            "# Generated by protoc-gen-actrframework-python",
-            "from __future__ import annotations",
-            "import abc",
-            "from typing import Any",
-            "from actr import WorkloadBase, Context, ActrType, Dest",
-            import_line,
-        ]
-    )
-
-
-def generate_handler(handler_name: str, methods) -> str:
-    """Generate handler protocol (abstract base class)."""
-    lines: List[str] = [f"class {handler_name}(abc.ABC):"]
-    if not methods:
-        lines.append("    pass")
-        return "\n".join(lines)
-
-    for method in methods:
-        method_name = to_snake_case(method.name)
-        input_type = extract_message_type(method.input_type)
-        output_type = extract_message_type(method.output_type)
-        lines.append(f"    # RPC method: {method.name}")
-        lines.append("    @abc.abstractmethod")
-        lines.append(
-            f"    async def {method_name}(self, req: pb2.{input_type}, ctx: Context) -> pb2.{output_type}:"
-        )
-        lines.append("        raise NotImplementedError")
-        lines.append("")
-
-    return "\n".join(lines).rstrip()
-
-
-def generate_dispatcher(
-    dispatcher_name: str,
-    methods,
-    remote_services: List[RemoteServiceInfo],
-    manufacturer: str,
-) -> str:
-    """Generate dispatcher with support for both local and remote methods."""
-    lines: List[str] = [
-        f"class {dispatcher_name}:",
-        "    async def dispatch(self, workload, route_key: str, payload: bytes, ctx: Any) -> bytes:",
-        "        handler = getattr(workload, \"handler\", workload)",
-    ]
-
-    if not methods and not remote_services:
-        lines.append("        raise RuntimeError(\"No RPC methods defined\")")
-    else:
-        lines.append("        if not isinstance(ctx, Context):")
-        lines.append("            ctx = Context(ctx)")
-        lines.append("")
-        lines.append("        # Local methods")
-        if methods:
-            lines.append("        local_route = _resolve_local_route(route_key)")
-            lines.append("        if local_route:")
-            lines.append("            method_name, req_cls, resp_cls = local_route")
-            lines.append("            req = req_cls.FromString(payload)")
-            lines.append("            resp = await getattr(handler, method_name)(req, ctx)")
-            lines.append("            return _encode_response(resp, resp_cls)")
-        
-        # Remote methods (proxying)
-        if remote_services:
-            lines.append("")
-            lines.append("        # Remote methods (proxying)")
-            for remote in remote_services:
-                route_keys_str = ", ".join(f'"{rk}"' for rk in remote.route_keys)
-                lines.append(f"        if route_key in [{route_keys_str}]:")
-                
-                # Parse actr_type (e.g., "acme+DataStreamConcurrentServer")
-                if "+" in remote.actr_type:
-                    parts = remote.actr_type.split("+", 1)
-                    remote_manufacturer = parts[0]
-                    remote_name = parts[1]
-                else:
-                    # Fallback to provided manufacturer and service name
-                    remote_manufacturer = manufacturer
-                    remote_name = remote.service_name
-                
-                lines.append(f"            target_type = ActrType(manufacturer=\"{remote_manufacturer}\", name=\"{remote_name}\")")
-                lines.append("            target_id = await ctx.discover(target_type)")
-                lines.append("            return await ctx._rust.call_raw(Dest.actor(target_id), route_key, payload)")
-        
-        lines.append("")
-        lines.append("        raise RuntimeError(f\"Unknown route_key: {route_key}\")")
-
-    return "\n".join(lines)
-
-
-def generate_route_helpers(package_name: str, service_name: str, methods) -> str:
-    """Generate routing table and helper functions for local methods."""
-    lines: List[str] = ["LOCAL_ROUTES = {"]
-    for method in methods:
-        method_name = to_snake_case(method.name)
-        input_type = extract_message_type(method.input_type)
-        output_type = extract_message_type(method.output_type)
-        route_key = make_route_key(package_name, service_name, method.name)
-        lines.append(
-            f"    \"{route_key}\": (\"{method_name}\", pb2.{input_type}, pb2.{output_type}),"
-        )
-    lines.append("}")
-    lines.append("")
-    lines.append("def _resolve_local_route(route_key: str):")
-    lines.append("    return LOCAL_ROUTES.get(route_key)")
-    lines.append("")
-    lines.append("def _encode_response(resp, resp_cls):")
-    lines.append("    if not isinstance(resp, resp_cls):")
-    lines.append("        raise ValueError(\"Response must match the declared protobuf type\")")
-    lines.append("    return resp.SerializeToString()")
-    return "\n".join(lines)
-
-
-def generate_rpc_request_extensions(
-    package_name: str,
-    service_name: str,
-    methods,
-) -> str:
-    """Generate RpcRequest extensions for client-side usage."""
-    if not methods:
-        return ""
-    
-    lines: List[str] = ["# RPC Request Extensions"]
-    for method in methods:
-        input_type = extract_message_type(method.input_type)
-        output_type = extract_message_type(method.output_type)
-        route_key = make_route_key(package_name, service_name, method.name)
-        
-        lines.append(f"# Extension for {input_type}")
-        lines.append(f"pb2.{input_type}.route_key = \"{route_key}\"")
-        lines.append(f"pb2.{input_type}.Response = pb2.{output_type}")
-        lines.append("")
-    
-    return "\n".join(lines).rstrip()
-
-
-def generate_workload(
-    workload_name: str,
-    handler_name: str,
-    dispatcher_name: str,
-) -> str:
-    """Generate workload class that wraps the handler."""
-    lines: List[str] = [
-        f"# {workload_name} wraps the user's handler implementation",
-        f"class {workload_name}(WorkloadBase):",
-        f"    def __init__(self, handler: {handler_name}):",
-        "        self.handler = handler",
-        f"        super().__init__({dispatcher_name}())",
-    ]
-    return "\n".join(lines)
-
-
-def generate_empty_workload_with_proxy(
-    workload_name: str,
-    remote_services: List[RemoteServiceInfo],
-    manufacturer: str,
-) -> str:
-    """Generate a workload for empty local proto that only proxies remote services."""
-    lines: List[str] = [
-        f"# {workload_name} - automatically generated for empty local proto",
-        f"class EmptyDispatcher:",
-        "    async def dispatch(self, workload, route_key: str, payload: bytes, ctx: Any) -> bytes:",
-        "        if not isinstance(ctx, Context):",
-        "            ctx = Context(ctx)",
-        "",
-    ]
-    
-    if remote_services:
-        lines.append("        # Remote methods (proxying)")
-        for remote in remote_services:
-            route_keys_str = ", ".join(f'"{rk}"' for rk in remote.route_keys)
-            lines.append(f"        if route_key in [{route_keys_str}]:")
-            
-            # Parse actr_type (e.g., "acme+DataStreamConcurrentServer")
-            if "+" in remote.actr_type:
-                parts = remote.actr_type.split("+", 1)
-                remote_manufacturer = parts[0]
-                remote_name = parts[1]
-            else:
-                # Fallback to provided manufacturer and service name
-                remote_manufacturer = manufacturer
-                remote_name = remote.service_name
-            
-            lines.append(f"            target_type = ActrType(manufacturer=\"{remote_manufacturer}\", name=\"{remote_name}\")")
-            lines.append("            target_id = await ctx.discover(target_type)")
-            lines.append("            return await ctx._rust.call_raw(Dest.actor(target_id), route_key, payload)")
-            lines.append("")
-    
-    lines.append("        raise RuntimeError(f\"Unknown route_key: {route_key}\")")
-    lines.append("")
-    lines.append(f"class {workload_name}(WorkloadBase):")
-    lines.append("    def __init__(self):")
-    lines.append("        super().__init__(EmptyDispatcher())")
-    
-    return "\n".join(lines)
-
-
-def generate_client_workload(
-    remote_services: List[RemoteServiceInfo],
-    manufacturer: str,
-) -> dict:
-    """Generate a generic client workload for proxying remote services only.
-    
-    This is used when a client has remote service dependencies but no local proto files.
-    """
-    workload_name = "DefaultWorkload"
-    dispatcher_name = "DefaultDispatcher"
-    file_name = "default_workload.py"
-    
-    sections: List[str] = [
-        generate_client_preamble(),
-        generate_client_dispatcher(dispatcher_name, remote_services, manufacturer),
-        generate_client_workload_class(workload_name, dispatcher_name),
-    ]
-    
-    content = "\n\n".join(section for section in sections if section)
-    return {"name": file_name, "content": content}
-
-
-def generate_client_preamble() -> str:
-    """Generate preamble for client workload file."""
-    return "\n".join(
-        [
-            "# DO NOT EDIT.",
-            "# Generated by protoc-gen-actrframework-python",
-            "from __future__ import annotations",
-            "from typing import Any",
-            "from actr import WorkloadBase, Context, ActrType, Dest",
-        ]
-    )
-
-
-def generate_client_dispatcher(
-    dispatcher_name: str,
-    remote_services: List[RemoteServiceInfo],
-    manufacturer: str,
-) -> str:
-    """Generate dispatcher for client that only proxies remote services."""
-    lines: List[str] = [
-        f"class {dispatcher_name}:",
-        "    async def dispatch(self, workload, route_key: str, payload: bytes, ctx: Any) -> bytes:",
-        "        if not isinstance(ctx, Context):",
-        "            ctx = Context(ctx)",
-        "",
-        "        # Remote methods (proxying)",
-    ]
-    
-    for remote in remote_services:
-        route_keys_str = ", ".join(f'"{rk}"' for rk in remote.route_keys)
-        lines.append(f"        if route_key in [{route_keys_str}]:")
-        
-        # Parse actr_type (e.g., "acme+DataStreamConcurrentServer")
-        if "+" in remote.actr_type:
-            parts = remote.actr_type.split("+", 1)
-            remote_manufacturer = parts[0]
-            remote_name = parts[1]
-        else:
-            # Fallback to provided manufacturer and service name
-            remote_manufacturer = manufacturer
-            remote_name = remote.service_name
-        
-        lines.append(f"            target_type = ActrType(manufacturer=\"{remote_manufacturer}\", name=\"{remote_name}\")")
-        lines.append("            target_id = await ctx.discover(target_type)")
-        lines.append("            return await ctx._rust.call_raw(Dest.actor(target_id), route_key, payload)")
-        lines.append("")
-    
-    lines.append("        raise RuntimeError(f\"Unknown route_key: {route_key}\")")
-    
-    return "\n".join(lines)
-
-
-def generate_client_workload_class(
-    workload_name: str,
-    dispatcher_name: str,
-) -> str:
-    """Generate client workload class."""
-    lines: List[str] = [
-        f"# {workload_name} - automatically generated for client with remote services only",
-        f"class {workload_name}(WorkloadBase):",
-        "    def __init__(self):",
-        f"        super().__init__({dispatcher_name}())",
-    ]
-    return "\n".join(lines)
-
-
-def extract_message_type(type_name: str) -> str:
-    """Extract the simple message type name from a fully qualified type."""
-    cleaned = type_name.lstrip(".")
-    return cleaned.split(".")[-1]
-
-
-def to_snake_case(name: str) -> str:
-    """Convert CamelCase to snake_case."""
-    out = []
-    for i, ch in enumerate(name):
-        if ch.isupper() and i != 0:
-            out.append("_")
-        out.append(ch.lower())
-    return "".join(out)
-
-
-def make_route_key(package_name: str, service_name: str, method_name: str) -> str:
-    """Generate a route key for a method."""
-    if package_name:
-        return f"{package_name}.{service_name}.{method_name}"
-    return f"{service_name}.{method_name}"
-
-
-def ensure_no_streaming_methods(service_name: str, methods) -> None:
-    """Validate that no streaming methods are defined."""
-    for method in methods:
-        if method.client_streaming or method.server_streaming:
-            raise ValueError(
-                f"Streaming RPC is not supported for {service_name}.{method.name}"
-            )
 
 
 if __name__ == "__main__":
