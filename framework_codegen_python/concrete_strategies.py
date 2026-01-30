@@ -164,12 +164,16 @@ class LocalServiceStrategy(GenerationStrategy):
                 remote_services=context.remote_services,
             )
             
-            file_name = f"{generators.to_snake_case(service.name)}_actor.py"
+            # Use package_name (which now contains project name) for filename
+            # e.g., package "echo_app" -> "echo_app_service_actor.py"
+            # This ensures consistency with template expectations
+            package_snake = generators.to_snake_case(file_desc.package) if file_desc.package else generators.to_snake_case(service.name)
+            file_name = f"{package_snake}_service_actor.py"
             generated_files.append(GeneratedFile(name=file_name, content=output))
             
             print(
                 f"INFO: Generated local actor code for service '{service.name}' "
-                f"in file '{file_desc.name}'",
+                f"in file '{file_desc.name}' as '{file_name}'",
                 file=sys.stderr
             )
         
